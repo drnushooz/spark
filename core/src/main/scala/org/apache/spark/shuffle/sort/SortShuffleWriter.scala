@@ -21,15 +21,15 @@ import org.apache.spark._
 import org.apache.spark.internal.Logging
 import org.apache.spark.scheduler.MapStatus
 import org.apache.spark.shuffle.{BaseShuffleHandle, IndexShuffleBlockResolver, ShuffleWriter}
-import org.apache.spark.storage.ShuffleBlockId
-import org.apache.spark.util.Utils
+import org.apache.spark.storage.{ShuffleBlockId, ShuffleFileSystem}
 import org.apache.spark.util.collection.ExternalSorter
 
 private[spark] class SortShuffleWriter[K, V, C](
     shuffleBlockResolver: IndexShuffleBlockResolver,
     handle: BaseShuffleHandle[K, V, C],
     mapId: Int,
-    context: TaskContext)
+    context: TaskContext,
+    shuffleFileSystem: ShuffleFileSystem)
   extends ShuffleWriter[K, V] with Logging {
 
   private val dep = handle.dependency
@@ -51,13 +51,13 @@ private[spark] class SortShuffleWriter[K, V, C](
   override def write(records: Iterator[Product2[K, V]]): Unit = {
     sorter = if (dep.mapSideCombine) {
       new ExternalSorter[K, V, C](
-        context, dep.aggregator, Some(dep.partitioner), dep.keyOrdering, dep.serializer)
+        context, dep.aggregator, Some(dep.partitioner), dep.keyOrdering, dep.serializer, shuffleFileSystem)
     } else {
       // In this case we pass neither an aggregator nor an ordering to the sorter, because we don't
       // care whether the keys get sorted in each partition; that will be done on the reduce side
       // if the operation being run is sortByKey.
       new ExternalSorter[K, V, V](
-        context, aggregator = None, Some(dep.partitioner), ordering = None, dep.serializer)
+        context, aggregator = None, Some(dep.partitioner), ordering = None, dep.serializer, shuffleFileSystem)
     }
     sorter.insertAll(records)
 
@@ -65,15 +65,15 @@ private[spark] class SortShuffleWriter[K, V, C](
     // because it just opens a single file, so is typically too fast to measure accurately
     // (see SPARK-3570).
     val output = shuffleBlockResolver.getDataFile(dep.shuffleId, mapId)
-    val tmp = Utils.tempFileWith(output)
+    val tmp = shuffleFileSystem.tempFileWith(output)
     try {
       val blockId = ShuffleBlockId(dep.shuffleId, mapId, IndexShuffleBlockResolver.NOOP_REDUCE_ID)
       val partitionLengths = sorter.writePartitionedFile(blockId, tmp)
       shuffleBlockResolver.writeIndexFileAndCommit(dep.shuffleId, mapId, partitionLengths, tmp)
       mapStatus = MapStatus(blockManager.shuffleServerId, partitionLengths)
     } finally {
-      if (tmp.exists() && !tmp.delete()) {
-        logError(s"Error while deleting temp file ${tmp.getAbsolutePath}")
+      if (shuffleFileSystem.exists(tmp) && !shuffleFileSystem.delete(tmp)) {
+        logError(s"Error while deleting temp file ${tmp.getPath}")
       }
     }
   }

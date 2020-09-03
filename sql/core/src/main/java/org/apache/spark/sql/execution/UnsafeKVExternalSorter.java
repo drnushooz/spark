@@ -32,6 +32,7 @@ import org.apache.spark.sql.catalyst.expressions.codegen.BaseOrdering;
 import org.apache.spark.sql.catalyst.expressions.codegen.GenerateOrdering;
 import org.apache.spark.sql.types.StructType;
 import org.apache.spark.storage.BlockManager;
+import org.apache.spark.storage.ShuffleFileSystem$;
 import org.apache.spark.unsafe.KVIterator;
 import org.apache.spark.unsafe.Platform;
 import org.apache.spark.unsafe.array.LongArray;
@@ -55,18 +56,16 @@ public final class UnsafeKVExternalSorter {
   public UnsafeKVExternalSorter(
       StructType keySchema,
       StructType valueSchema,
-      BlockManager blockManager,
       SerializerManager serializerManager,
       long pageSizeBytes,
       int numElementsForSpillThreshold) throws IOException {
-    this(keySchema, valueSchema, blockManager, serializerManager, pageSizeBytes,
+    this(keySchema, valueSchema, serializerManager, pageSizeBytes,
       numElementsForSpillThreshold, null);
   }
 
   public UnsafeKVExternalSorter(
       StructType keySchema,
       StructType valueSchema,
-      BlockManager blockManager,
       SerializerManager serializerManager,
       long pageSizeBytes,
       int numElementsForSpillThreshold,
@@ -88,7 +87,6 @@ public final class UnsafeKVExternalSorter {
     if (map == null) {
       sorter = UnsafeExternalSorter.create(
         taskMemoryManager,
-        blockManager,
         serializerManager,
         taskContext,
         comparatorSupplier,
@@ -97,7 +95,8 @@ public final class UnsafeKVExternalSorter {
                                      UnsafeExternalRowSorter.DEFAULT_INITIAL_SORT_BUFFER_SIZE),
         pageSizeBytes,
         numElementsForSpillThreshold,
-        canUseRadixSort);
+        canUseRadixSort,
+        ShuffleFileSystem$.MODULE$.apply());
     } else {
       // During spilling, the pointer array in `BytesToBytesMap` will not be used, so we can borrow
       // that and use it as the pointer array for `UnsafeInMemorySorter`.
@@ -155,7 +154,6 @@ public final class UnsafeKVExternalSorter {
 
       sorter = UnsafeExternalSorter.createWithExistingInMemorySorter(
         taskMemoryManager,
-        blockManager,
         serializerManager,
         taskContext,
         comparatorSupplier,
@@ -164,7 +162,8 @@ public final class UnsafeKVExternalSorter {
                                      UnsafeExternalRowSorter.DEFAULT_INITIAL_SORT_BUFFER_SIZE),
         pageSizeBytes,
         numElementsForSpillThreshold,
-        inMemSorter);
+        inMemSorter,
+        ShuffleFileSystem$.MODULE$.apply());
 
       // reset the map, so we can re-use it to insert new records. the inMemSorter will not used
       // anymore, so the underline array could be used by map again.

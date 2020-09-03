@@ -29,6 +29,7 @@ import org.apache.spark.internal.config._
 import org.apache.spark.io.CompressionCodec
 import org.apache.spark.memory.MemoryTestingUtils
 import org.apache.spark.util.CompletionIterator
+import scala.language.postfixOps
 
 class ExternalAppendOnlyMapSuite extends SparkFunSuite
   with LocalSparkContext

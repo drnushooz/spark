@@ -18,13 +18,15 @@
 package org.apache.spark.unsafe.map;
 
 import javax.annotation.Nullable;
-import java.io.File;
 import java.io.IOException;
+import java.net.URI;
 import java.util.Iterator;
 import java.util.LinkedList;
 
 import com.google.common.annotations.VisibleForTesting;
 import com.google.common.io.Closeables;
+import org.apache.spark.storage.ShuffleFileSystem;
+import org.apache.spark.storage.ShuffleFileSystem$;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
@@ -33,7 +35,6 @@ import org.apache.spark.executor.ShuffleWriteMetrics;
 import org.apache.spark.memory.MemoryConsumer;
 import org.apache.spark.memory.TaskMemoryManager;
 import org.apache.spark.serializer.SerializerManager;
-import org.apache.spark.storage.BlockManager;
 import org.apache.spark.unsafe.Platform;
 import org.apache.spark.unsafe.UnsafeAlignedOffset;
 import org.apache.spark.unsafe.array.ByteArrayMethods;
@@ -168,22 +169,21 @@ public final class BytesToBytesMap extends MemoryConsumer {
 
   private final int initialCapacity;
 
-  private final BlockManager blockManager;
   private final SerializerManager serializerManager;
   private volatile MapIterator destructiveIterator = null;
   private LinkedList<UnsafeSorterSpillWriter> spillWriters = new LinkedList<>();
+  private final ShuffleFileSystem shuffleFileSystem;
 
   public BytesToBytesMap(
       TaskMemoryManager taskMemoryManager,
-      BlockManager blockManager,
       SerializerManager serializerManager,
       int initialCapacity,
       double loadFactor,
       long pageSizeBytes,
-      boolean enablePerfMetrics) {
+      boolean enablePerfMetrics,
+      ShuffleFileSystem shuffleFileSystem) {
     super(taskMemoryManager, pageSizeBytes, taskMemoryManager.getTungstenMemoryMode());
     this.taskMemoryManager = taskMemoryManager;
-    this.blockManager = blockManager;
     this.serializerManager = serializerManager;
     this.loadFactor = loadFactor;
     this.loc = new Location();
@@ -202,12 +202,14 @@ public final class BytesToBytesMap extends MemoryConsumer {
     }
     this.initialCapacity = initialCapacity;
     allocate(initialCapacity);
+    this.shuffleFileSystem = shuffleFileSystem;
   }
 
   public BytesToBytesMap(
       TaskMemoryManager taskMemoryManager,
       int initialCapacity,
-      long pageSizeBytes) {
+      long pageSizeBytes,
+      ShuffleFileSystem shuffleFileSystem) {
     this(taskMemoryManager, initialCapacity, pageSizeBytes, false);
   }
 
@@ -218,13 +220,13 @@ public final class BytesToBytesMap extends MemoryConsumer {
       boolean enablePerfMetrics) {
     this(
       taskMemoryManager,
-      SparkEnv.get() != null ? SparkEnv.get().blockManager() :  null,
       SparkEnv.get() != null ? SparkEnv.get().serializerManager() :  null,
       initialCapacity,
       // In order to re-use the longArray for sorting, the load factor cannot be larger than 0.5.
       0.5,
       pageSizeBytes,
-      enablePerfMetrics);
+      enablePerfMetrics,
+      ShuffleFileSystem$.MODULE$.apply());
   }
 
   /**
@@ -379,7 +381,7 @@ public final class BytesToBytesMap extends MemoryConsumer {
           int uaoSize = UnsafeAlignedOffset.getUaoSize();
           offset += uaoSize;
           final UnsafeSorterSpillWriter writer =
-            new UnsafeSorterSpillWriter(blockManager, 32 * 1024, writeMetrics, numRecords);
+            new UnsafeSorterSpillWriter(32 * 1024, writeMetrics, numRecords, shuffleFileSystem);
           while (numRecords > 0) {
             int length = UnsafeAlignedOffset.getSize(base, offset);
             writer.write(base, offset + uaoSize, length, 0);
@@ -409,9 +411,9 @@ public final class BytesToBytesMap extends MemoryConsumer {
 
     private void handleFailedDelete() {
       // remove the spill file from disk
-      File file = spillWriters.removeFirst().getFile();
-      if (file != null && file.exists() && !file.delete()) {
-        logger.error("Was unable to delete spill file {}", file.getAbsolutePath());
+      URI file = spillWriters.removeFirst().getFile();
+      if (file != null && shuffleFileSystem.exists(file) && !shuffleFileSystem.delete(file)) {
+        logger.error("Was unable to delete spill file {}", file.getPath());
       }
     }
   }
@@ -825,10 +827,10 @@ public final class BytesToBytesMap extends MemoryConsumer {
     assert(dataPages.isEmpty());
 
     while (!spillWriters.isEmpty()) {
-      File file = spillWriters.removeFirst().getFile();
-      if (file != null && file.exists()) {
-        if (!file.delete()) {
-          logger.error("Was unable to delete spill file {}", file.getAbsolutePath());
+      URI file = spillWriters.removeFirst().getFile();
+      if (file != null && shuffleFileSystem.exists(file)) {
+        if (!shuffleFileSystem.delete(file)) {
+          logger.error("Was unable to delete spill file {}", file.getPath());
         }
       }
     }

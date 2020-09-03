@@ -20,6 +20,7 @@ package org.apache.spark.sql.execution;
 import java.io.IOException;
 import java.util.function.Supplier;
 
+import org.apache.spark.storage.ShuffleFileSystem$;
 import scala.collection.AbstractIterator;
 import scala.collection.Iterator;
 import scala.math.Ordering;
@@ -107,7 +108,6 @@ public final class UnsafeExternalRowSorter {
     final TaskContext taskContext = TaskContext.get();
     sorter = UnsafeExternalSorter.create(
       taskContext.taskMemoryManager(),
-      sparkEnv.blockManager(),
       sparkEnv.serializerManager(),
       taskContext,
       recordComparatorSupplier,
@@ -117,7 +117,8 @@ public final class UnsafeExternalRowSorter {
       pageSizeBytes,
       (int) SparkEnv.get().conf().get(
         package$.MODULE$.SHUFFLE_SPILL_NUM_ELEMENTS_FORCE_SPILL_THRESHOLD()),
-      canUseRadixSort
+      canUseRadixSort,
+      ShuffleFileSystem$.MODULE$.apply()
     );
   }
 

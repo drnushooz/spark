@@ -19,10 +19,12 @@ package org.apache.spark.util.collection.unsafe.sort;
 
 import java.io.File;
 import java.io.IOException;
+import java.net.URI;
 import java.util.Arrays;
 import java.util.LinkedList;
 import java.util.UUID;
 
+import org.apache.spark.SparkEnv;
 import org.hamcrest.Matchers;
 import scala.Tuple2$;
 
@@ -56,7 +58,7 @@ public class UnsafeExternalSorterSuite {
 
   private final SparkConf conf = new SparkConf();
 
-  final LinkedList<File> spillFilesCreated = new LinkedList<>();
+  final LinkedList<URI> spillFilesCreated = new LinkedList<>();
   final TestMemoryManager memoryManager =
     new TestMemoryManager(conf.clone().set("spark.memory.offHeap.enabled", "false"));
   final TaskMemoryManager taskMemoryManager = new TaskMemoryManager(memoryManager, 0);
@@ -79,11 +81,13 @@ public class UnsafeExternalSorterSuite {
       return 0;
     }
   };
+  private ShuffleFileSystem shuffleFileSystem;
 
-  File tempDir;
+  URI tempDir;
   @Mock(answer = RETURNS_SMART_NULLS) BlockManager blockManager;
   @Mock(answer = RETURNS_SMART_NULLS) DiskBlockManager diskBlockManager;
   @Mock(answer = RETURNS_SMART_NULLS) TaskContext taskContext;
+  @Mock(answer = RETURNS_SMART_NULLS) SparkEnv sparkEnv;
 
   protected boolean shouldUseRadixSort() { return false; }
 
@@ -95,16 +99,24 @@ public class UnsafeExternalSorterSuite {
   @Before
   public void setUp() {
     MockitoAnnotations.initMocks(this);
-    tempDir = Utils.createTempDir(System.getProperty("java.io.tmpdir"), "unsafe-test");
+    when(sparkEnv.blockManager()).thenReturn(blockManager);
+    when(sparkEnv.conf()).thenReturn(conf);
+    SparkEnv.set(sparkEnv);
+
     spillFilesCreated.clear();
     taskContext = mock(TaskContext.class);
     when(taskContext.taskMetrics()).thenReturn(new TaskMetrics());
+
+    shuffleFileSystem = new LocalShuffleFileSystem();
+    tempDir = shuffleFileSystem.createTempDir(System.getProperty("java.io.tmpdir"), "unsafe-test");
+
     when(blockManager.diskBlockManager()).thenReturn(diskBlockManager);
     when(diskBlockManager.createTempLocalBlock()).thenAnswer(invocationOnMock -> {
       TempLocalBlockId blockId = new TempLocalBlockId(UUID.randomUUID());
-      File file = File.createTempFile("spillFile", ".spill", tempDir);
+      File tempFile = File.createTempFile("spillFile", ".spill", new File(tempDir.getPath()));
+      URI file = URI.create(tempFile.getAbsolutePath());
       spillFilesCreated.add(file);
-      return Tuple2$.MODULE$.apply(blockId, file);
+      return Tuple2$.MODULE$.apply(blockId, tempFile);
     });
     when(blockManager.getDiskWriter(
       any(BlockId.class),
@@ -115,13 +127,14 @@ public class UnsafeExternalSorterSuite {
         Object[] args = invocationOnMock.getArguments();
 
         return new DiskBlockObjectWriter(
-          (File) args[1],
+          ((File) args[1]).toURI(),
           serializerManager,
           (SerializerInstance) args[2],
           (Integer) args[3],
           false,
           (ShuffleWriteMetrics) args[4],
-          (BlockId) args[0]
+          (BlockId) args[0],
+          shuffleFileSystem
         );
       });
   }
@@ -131,15 +144,16 @@ public class UnsafeExternalSorterSuite {
     try {
       assertEquals(0L, taskMemoryManager.cleanUpAllAllocatedMemory());
     } finally {
-      Utils.deleteRecursively(tempDir);
+      shuffleFileSystem.deleteRecursively(tempDir);
       tempDir = null;
     }
+    shuffleFileSystem.close();
   }
 
   private void assertSpillFilesWereCleanedUp() {
-    for (File spillFile : spillFilesCreated) {
+    for (URI spillFile : spillFilesCreated) {
       assertFalse("Spill file " + spillFile.getPath() + " was not cleaned up",
-        spillFile.exists());
+        shuffleFileSystem.exists(spillFile));
     }
   }
 
@@ -158,7 +172,6 @@ public class UnsafeExternalSorterSuite {
   private UnsafeExternalSorter newSorter() throws IOException {
     return UnsafeExternalSorter.create(
       taskMemoryManager,
-      blockManager,
       serializerManager,
       taskContext,
       () -> recordComparator,
@@ -166,7 +179,8 @@ public class UnsafeExternalSorterSuite {
       /* initialSize */ 1024,
       pageSizeBytes,
       spillThreshold,
-      shouldUseRadixSort());
+      shouldUseRadixSort(),
+      shuffleFileSystem);
   }
 
   @Test
@@ -248,7 +262,7 @@ public class UnsafeExternalSorterSuite {
     // The insertion of this record should trigger a spill:
     insertNumber(sorter, 0);
     // Ensure that spill files were created
-    assertThat(tempDir.listFiles().length, greaterThanOrEqualTo(1));
+    assertThat(shuffleFileSystem.getFileCount(tempDir), greaterThanOrEqualTo(1L));
     // Read back the sorted data:
     UnsafeSorterIterator iter = sorter.getSortedIterator();
 
@@ -382,7 +396,6 @@ public class UnsafeExternalSorterSuite {
   public void forcedSpillingWithoutComparator() throws Exception {
     final UnsafeExternalSorter sorter = UnsafeExternalSorter.create(
       taskMemoryManager,
-      blockManager,
       serializerManager,
       taskContext,
       null,
@@ -390,7 +403,8 @@ public class UnsafeExternalSorterSuite {
       /* initialSize */ 1024,
       pageSizeBytes,
       spillThreshold,
-      shouldUseRadixSort());
+      shouldUseRadixSort(),
+      shuffleFileSystem);
     long[] record = new long[100];
     int recordSize = record.length * 8;
     int n = (int) pageSizeBytes / recordSize * 3;
@@ -444,7 +458,6 @@ public class UnsafeExternalSorterSuite {
     final long numRecordsPerPage = pageSizeBytes / recordLengthBytes;
     final UnsafeExternalSorter sorter = UnsafeExternalSorter.create(
       taskMemoryManager,
-      blockManager,
       serializerManager,
       taskContext,
       () -> recordComparator,
@@ -452,7 +465,8 @@ public class UnsafeExternalSorterSuite {
       1024,
       pageSizeBytes,
       spillThreshold,
-      shouldUseRadixSort());
+      shouldUseRadixSort(),
+      shuffleFileSystem);
 
     // Peak memory should be monotonically increasing. More specifically, every time
     // we allocate a new page it should increase by exactly the size of the page.

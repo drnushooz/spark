@@ -18,15 +18,13 @@
 package org.apache.spark.shuffle
 
 import java.io._
-import java.nio.channels.Channels
-import java.nio.file.Files
+import java.nio.file.Paths
+import java.net.URI
 
-import org.apache.spark.{SparkConf, SparkEnv}
+import org.apache.spark.SparkConf
 import org.apache.spark.internal.Logging
-import org.apache.spark.io.NioBufferedFileInputStream
-import org.apache.spark.network.buffer.{FileSegmentManagedBuffer, ManagedBuffer}
+import org.apache.spark.network.buffer.ManagedBuffer
 import org.apache.spark.network.netty.SparkTransportConf
-import org.apache.spark.shuffle.IndexShuffleBlockResolver.NOOP_REDUCE_ID
 import org.apache.spark.storage._
 import org.apache.spark.util.Utils
 
@@ -43,54 +41,41 @@ import org.apache.spark.util.Utils
 // org.apache.spark.network.shuffle.ExternalShuffleBlockResolver#getSortBasedShuffleBlockData().
 private[spark] class IndexShuffleBlockResolver(
     conf: SparkConf,
-    _blockManager: BlockManager = null)
+    shuffleFileSystem: ShuffleFileSystem)
   extends ShuffleBlockResolver
   with Logging {
 
-  private lazy val blockManager = Option(_blockManager).getOrElse(SparkEnv.get.blockManager)
-
   private val transportConf = SparkTransportConf.fromSparkConf(conf, "shuffle")
 
-  def getDataFile(shuffleId: Int, mapId: Int): File = {
-    blockManager.diskBlockManager.getFile(ShuffleDataBlockId(shuffleId, mapId, NOOP_REDUCE_ID))
+  def getDataFile(shuffleId: Int, mapId: Int): URI = {
+    shuffleFileSystem.getTempFilePath(ShuffleDataBlockId(shuffleId, mapId, IndexShuffleBlockResolver.NOOP_REDUCE_ID).name)
   }
 
-  private def getIndexFile(shuffleId: Int, mapId: Int): File = {
-    blockManager.diskBlockManager.getFile(ShuffleIndexBlockId(shuffleId, mapId, NOOP_REDUCE_ID))
+  private def getIndexFile(shuffleId: Int, mapId: Int): URI = {
+    shuffleFileSystem.getTempFilePath(ShuffleIndexBlockId(shuffleId, mapId, IndexShuffleBlockResolver.NOOP_REDUCE_ID).name)
   }
 
   /**
    * Remove data file and index file that contain the output data from one map.
    */
   def removeDataByMap(shuffleId: Int, mapId: Int): Unit = {
-    var file = getDataFile(shuffleId, mapId)
-    if (file.exists()) {
-      if (!file.delete()) {
-        logWarning(s"Error deleting data ${file.getPath()}")
-      }
-    }
-
-    file = getIndexFile(shuffleId, mapId)
-    if (file.exists()) {
-      if (!file.delete()) {
-        logWarning(s"Error deleting index ${file.getPath()}")
-      }
-    }
+    shuffleFileSystem.delete(getDataFile(shuffleId, mapId))
+    shuffleFileSystem.delete(getIndexFile(shuffleId, mapId))
   }
 
   /**
    * Check whether the given index and data files match each other.
    * If so, return the partition lengths in the data file. Otherwise return null.
    */
-  private def checkIndexAndDataFile(index: File, data: File, blocks: Int): Array[Long] = {
+  private def checkIndexAndDataFile(index: URI, data: URI, blocks: Int): Array[Long] = {
     // the index file should have `block + 1` longs as offset.
-    if (index.length() != (blocks + 1) * 8L) {
+    if (shuffleFileSystem.getFileSize(index) != (blocks + 1) * 8L) {
       return null
     }
     val lengths = new Array[Long](blocks)
     // Read the lengths of blocks
     val in = try {
-      new DataInputStream(new NioBufferedFileInputStream(index))
+      shuffleFileSystem.open(index)
     } catch {
       case e: IOException =>
         return null
@@ -116,7 +101,7 @@ private[spark] class IndexShuffleBlockResolver(
     }
 
     // the size of data file should match with index file
-    if (data.length() == lengths.sum) {
+    if (shuffleFileSystem.getFileSize(data) == lengths.sum) {
       lengths
     } else {
       null
@@ -137,9 +122,9 @@ private[spark] class IndexShuffleBlockResolver(
       shuffleId: Int,
       mapId: Int,
       lengths: Array[Long],
-      dataTmp: File): Unit = {
+      dataTmp: URI): Unit = {
     val indexFile = getIndexFile(shuffleId, mapId)
-    val indexTmp = Utils.tempFileWith(indexFile)
+    val indexTmp = shuffleFileSystem.tempFileWith(indexFile)
     try {
       val dataFile = getDataFile(shuffleId, mapId)
       // There is only one IndexShuffleBlockResolver per executor, this synchronization make sure
@@ -150,13 +135,13 @@ private[spark] class IndexShuffleBlockResolver(
           // Another attempt for the same task has already written our map outputs successfully,
           // so just use the existing partition lengths and delete our temporary map outputs.
           System.arraycopy(existingLengths, 0, lengths, 0, lengths.length)
-          if (dataTmp != null && dataTmp.exists()) {
-            dataTmp.delete()
+          if (dataTmp != null && shuffleFileSystem.exists(dataTmp)) {
+            shuffleFileSystem.delete(dataTmp)
           }
         } else {
           // This is the first successful attempt in writing the map outputs for this task,
           // so override any existing index and data files with the ones we wrote.
-          val out = new DataOutputStream(new BufferedOutputStream(new FileOutputStream(indexTmp)))
+          val out = shuffleFileSystem.create(indexTmp, append = false)
           Utils.tryWithSafeFinally {
             // We take in lengths of each block, need to convert it to offsets.
             var offset = 0L
@@ -169,23 +154,23 @@ private[spark] class IndexShuffleBlockResolver(
             out.close()
           }
 
-          if (indexFile.exists()) {
-            indexFile.delete()
+          if (shuffleFileSystem.exists(indexFile)) {
+            shuffleFileSystem.delete(indexFile)
           }
-          if (dataFile.exists()) {
-            dataFile.delete()
+          if (shuffleFileSystem.exists(dataFile)) {
+            shuffleFileSystem.delete(dataFile)
           }
-          if (!indexTmp.renameTo(indexFile)) {
+          if (!shuffleFileSystem.rename(indexTmp, indexFile)) {
             throw new IOException("fail to rename file " + indexTmp + " to " + indexFile)
           }
-          if (dataTmp != null && dataTmp.exists() && !dataTmp.renameTo(dataFile)) {
+          if (dataTmp != null && shuffleFileSystem.exists(dataTmp) && !shuffleFileSystem.rename(dataTmp, dataFile)) {
             throw new IOException("fail to rename file " + dataTmp + " to " + dataFile)
           }
         }
       }
     } finally {
-      if (indexTmp.exists() && !indexTmp.delete()) {
-        logError(s"Failed to delete temporary index file at ${indexTmp.getAbsolutePath}")
+      if (shuffleFileSystem.exists(indexTmp) && !shuffleFileSystem.delete(indexTmp)) {
+        logError(s"Failed to delete temporary index file at ${Paths.get(indexTmp).toAbsolutePath}")
       }
     }
   }
@@ -201,25 +186,20 @@ private[spark] class IndexShuffleBlockResolver(
     // checks added here were a useful debugging aid during SPARK-22982 and may help prevent this
     // class of issue from re-occurring in the future which is why they are left here even though
     // SPARK-22982 is fixed.
-    val channel = Files.newByteChannel(indexFile.toPath)
-    channel.position(blockId.reduceId * 8L)
-    val in = new DataInputStream(Channels.newInputStream(channel))
+    val indexStream = shuffleFileSystem.open(indexFile)
+    indexStream.seek(blockId.reduceId * 8L)
     try {
-      val offset = in.readLong()
-      val nextOffset = in.readLong()
-      val actualPosition = channel.position()
+      val offset = indexStream.readLong()
+      val nextOffset = indexStream.readLong()
+      val actualPosition = indexStream.getPos
       val expectedPosition = blockId.reduceId * 8L + 16
       if (actualPosition != expectedPosition) {
         throw new Exception(s"SPARK-22982: Incorrect channel position after index file reads: " +
           s"expected $expectedPosition but actual position was $actualPosition.")
       }
-      new FileSegmentManagedBuffer(
-        transportConf,
-        getDataFile(blockId.shuffleId, blockId.mapId),
-        offset,
-        nextOffset - offset)
+      shuffleFileSystem.createManagedBuffer(transportConf, getDataFile(blockId.shuffleId, blockId.mapId), offset, nextOffset - offset)
     } finally {
-      in.close()
+      indexStream.close()
     }
   }
 

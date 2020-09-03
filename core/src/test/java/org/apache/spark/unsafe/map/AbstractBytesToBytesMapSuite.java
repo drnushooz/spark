@@ -19,9 +19,11 @@ package org.apache.spark.unsafe.map;
 
 import java.io.File;
 import java.io.IOException;
+import java.net.URI;
 import java.nio.ByteBuffer;
 import java.util.*;
 
+import org.apache.spark.SparkEnv;
 import scala.Tuple2$;
 
 import org.junit.After;
@@ -44,7 +46,7 @@ import org.apache.spark.serializer.SerializerManager;
 import org.apache.spark.storage.*;
 import org.apache.spark.unsafe.Platform;
 import org.apache.spark.unsafe.array.ByteArrayMethods;
-import org.apache.spark.util.Utils;
+import org.apache.spark.internal.config.package$;
 
 import static org.hamcrest.Matchers.greaterThan;
 import static org.junit.Assert.assertEquals;
@@ -65,33 +67,42 @@ public abstract class AbstractBytesToBytesMapSuite {
       new JavaSerializer(new SparkConf()),
       new SparkConf().set("spark.shuffle.spill.compress", "false"));
   private static final long PAGE_SIZE_BYTES = 1L << 26; // 64 megabytes
+  private ShuffleFileSystem shuffleFileSystem;
 
-  final LinkedList<File> spillFilesCreated = new LinkedList<>();
-  File tempDir;
+  final LinkedList<URI> spillFilesCreated = new LinkedList<>();
+  private URI tempDir;
 
+  @Mock(answer = RETURNS_SMART_NULLS) SparkEnv sparkEnv;
   @Mock(answer = RETURNS_SMART_NULLS) BlockManager blockManager;
   @Mock(answer = RETURNS_SMART_NULLS) DiskBlockManager diskBlockManager;
 
   @Before
   public void setup() {
-    memoryManager =
-      new TestMemoryManager(
-        new SparkConf()
-          .set("spark.memory.offHeap.enabled", "" + useOffHeapMemoryAllocator())
-          .set("spark.memory.offHeap.size", "256mb")
-          .set("spark.shuffle.spill.compress", "false")
-          .set("spark.shuffle.compress", "false"));
-    taskMemoryManager = new TaskMemoryManager(memoryManager, 0);
-
-    tempDir = Utils.createTempDir(System.getProperty("java.io.tmpdir"), "unsafe-test");
     spillFilesCreated.clear();
     MockitoAnnotations.initMocks(this);
+
+    SparkConf conf = new SparkConf()
+      .set("spark.memory.offHeap.enabled", "" + useOffHeapMemoryAllocator())
+      .set("spark.memory.offHeap.size", "256mb")
+      .set("spark.shuffle.spill.compress", "false")
+      .set("spark.shuffle.compress", "false");
+    memoryManager = new TestMemoryManager(conf);
+    taskMemoryManager = new TaskMemoryManager(memoryManager, 0);
+
+    when(sparkEnv.blockManager()).thenReturn(blockManager);
+    when(sparkEnv.conf()).thenReturn(conf);
+    SparkEnv.set(sparkEnv);
+
+    shuffleFileSystem = new LocalShuffleFileSystem();
+    tempDir = shuffleFileSystem.createTempDir(System.getProperty("java.io.tmpdir"), "unsafe-test");
+
     when(blockManager.diskBlockManager()).thenReturn(diskBlockManager);
     when(diskBlockManager.createTempLocalBlock()).thenAnswer(invocationOnMock -> {
       TempLocalBlockId blockId = new TempLocalBlockId(UUID.randomUUID());
-      File file = File.createTempFile("spillFile", ".spill", tempDir);
+      File tempFile = File.createTempFile("spillFile", ".spill", new File(tempDir.getPath()));
+      URI file = URI.create(tempFile.getAbsolutePath());
       spillFilesCreated.add(file);
-      return Tuple2$.MODULE$.apply(blockId, file);
+      return Tuple2$.MODULE$.apply(blockId, tempFile);
     });
     when(blockManager.getDiskWriter(
       any(BlockId.class),
@@ -102,20 +113,21 @@ public abstract class AbstractBytesToBytesMapSuite {
         Object[] args = invocationOnMock.getArguments();
 
         return new DiskBlockObjectWriter(
-          (File) args[1],
+          ((File) args[1]).toURI(),
           serializerManager,
           (SerializerInstance) args[2],
           (Integer) args[3],
           false,
           (ShuffleWriteMetrics) args[4],
-          (BlockId) args[0]
+          (BlockId) args[0],
+          shuffleFileSystem
         );
       });
   }
 
   @After
   public void tearDown() {
-    Utils.deleteRecursively(tempDir);
+    shuffleFileSystem.deleteRecursively(tempDir);
     tempDir = null;
 
     if (taskMemoryManager != null) {
@@ -124,6 +136,7 @@ public abstract class AbstractBytesToBytesMapSuite {
       taskMemoryManager = null;
       Assert.assertEquals(0L, leakedMemory);
     }
+    shuffleFileSystem.close();
   }
 
   protected abstract boolean useOffHeapMemoryAllocator();
@@ -162,7 +175,7 @@ public abstract class AbstractBytesToBytesMapSuite {
 
   @Test
   public void emptyMap() {
-    BytesToBytesMap map = new BytesToBytesMap(taskMemoryManager, 64, PAGE_SIZE_BYTES);
+    BytesToBytesMap map = new BytesToBytesMap(taskMemoryManager, 64, PAGE_SIZE_BYTES, shuffleFileSystem);
     try {
       Assert.assertEquals(0, map.numKeys());
       final int keyLengthInWords = 10;
@@ -177,7 +190,7 @@ public abstract class AbstractBytesToBytesMapSuite {
 
   @Test
   public void setAndRetrieveAKey() {
-    BytesToBytesMap map = new BytesToBytesMap(taskMemoryManager, 64, PAGE_SIZE_BYTES);
+    BytesToBytesMap map = new BytesToBytesMap(taskMemoryManager, 64, PAGE_SIZE_BYTES, shuffleFileSystem);
     final int recordLengthWords = 10;
     final int recordLengthBytes = recordLengthWords * 8;
     final byte[] keyData = getRandomByteArray(recordLengthWords);
@@ -233,7 +246,7 @@ public abstract class AbstractBytesToBytesMapSuite {
 
   private void iteratorTestBase(boolean destructive) throws Exception {
     final int size = 4096;
-    BytesToBytesMap map = new BytesToBytesMap(taskMemoryManager, size / 2, PAGE_SIZE_BYTES);
+    BytesToBytesMap map = new BytesToBytesMap(taskMemoryManager, size / 2, PAGE_SIZE_BYTES, shuffleFileSystem);
     try {
       for (long i = 0; i < size; i++) {
         final long[] value = new long[] { i };
@@ -316,7 +329,7 @@ public abstract class AbstractBytesToBytesMapSuite {
     final int KEY_LENGTH = 24;
     final int VALUE_LENGTH = 40;
     final BytesToBytesMap map =
-      new BytesToBytesMap(taskMemoryManager, NUM_ENTRIES, PAGE_SIZE_BYTES);
+      new BytesToBytesMap(taskMemoryManager, NUM_ENTRIES, PAGE_SIZE_BYTES, shuffleFileSystem);
     // Each record will take 8 + 24 + 40 = 72 bytes of space in the data page. Our 64-megabyte
     // pages won't be evenly-divisible by records of this size, which will cause us to waste some
     // space at the end of the page. This is necessary in order for us to take the end-of-record
@@ -385,7 +398,7 @@ public abstract class AbstractBytesToBytesMapSuite {
     // Java arrays' hashCodes() aren't based on the arrays' contents, so we need to wrap arrays
     // into ByteBuffers in order to use them as keys here.
     final Map<ByteBuffer, byte[]> expected = new HashMap<>();
-    final BytesToBytesMap map = new BytesToBytesMap(taskMemoryManager, size, PAGE_SIZE_BYTES);
+    final BytesToBytesMap map = new BytesToBytesMap(taskMemoryManager, size, PAGE_SIZE_BYTES, shuffleFileSystem);
     try {
       // Fill the map to 90% full so that we can trigger probing
       for (int i = 0; i < size * 0.9; i++) {
@@ -437,7 +450,7 @@ public abstract class AbstractBytesToBytesMapSuite {
   @Test
   public void randomizedTestWithRecordsLargerThanPageSize() {
     final long pageSizeBytes = 128;
-    final BytesToBytesMap map = new BytesToBytesMap(taskMemoryManager, 64, pageSizeBytes);
+    final BytesToBytesMap map = new BytesToBytesMap(taskMemoryManager, 64, pageSizeBytes, shuffleFileSystem);
     // Java arrays' hashCodes() aren't based on the arrays' contents, so we need to wrap arrays
     // into ByteBuffers in order to use them as keys here.
     final Map<ByteBuffer, byte[]> expected = new HashMap<>();
@@ -490,7 +503,7 @@ public abstract class AbstractBytesToBytesMapSuite {
   @Test
   public void failureToAllocateFirstPage() {
     memoryManager.limit(1024);  // longArray
-    BytesToBytesMap map = new BytesToBytesMap(taskMemoryManager, 1, PAGE_SIZE_BYTES);
+    BytesToBytesMap map = new BytesToBytesMap(taskMemoryManager, 1, PAGE_SIZE_BYTES, shuffleFileSystem);
     try {
       final long[] emptyArray = new long[0];
       final BytesToBytesMap.Location loc =
@@ -506,7 +519,7 @@ public abstract class AbstractBytesToBytesMapSuite {
 
   @Test
   public void failureToGrow() {
-    BytesToBytesMap map = new BytesToBytesMap(taskMemoryManager, 1, 1024);
+    BytesToBytesMap map = new BytesToBytesMap(taskMemoryManager, 1, 1024, shuffleFileSystem);
     try {
       boolean success = true;
       int i;
@@ -532,7 +545,7 @@ public abstract class AbstractBytesToBytesMapSuite {
   @Test
   public void spillInIterator() throws IOException {
     BytesToBytesMap map = new BytesToBytesMap(
-      taskMemoryManager, blockManager, serializerManager, 1, 0.75, 1024, false);
+      taskMemoryManager, serializerManager, 1, 0.75, 1024, false, shuffleFileSystem);
     try {
       int i;
       for (i = 0; i < 1024; i++) {
@@ -561,9 +574,9 @@ public abstract class AbstractBytesToBytesMapSuite {
       assertFalse(iter2.hasNext());
     } finally {
       map.free();
-      for (File spillFile : spillFilesCreated) {
-        assertFalse("Spill file " + spillFile.getPath() + " was not cleaned up",
-          spillFile.exists());
+      for (URI spillFile : spillFilesCreated) {
+        assertFalse("Spill file " + spillFile + " was not cleaned up",
+          shuffleFileSystem.exists(spillFile));
       }
     }
   }
@@ -571,7 +584,7 @@ public abstract class AbstractBytesToBytesMapSuite {
   @Test
   public void multipleValuesForSameKey() {
     BytesToBytesMap map =
-      new BytesToBytesMap(taskMemoryManager, blockManager, serializerManager, 1, 0.5, 1024, false);
+      new BytesToBytesMap(taskMemoryManager, serializerManager, 1, 0.5, 1024, false, shuffleFileSystem);
     try {
       int i;
       for (i = 0; i < 1024; i++) {
@@ -609,7 +622,7 @@ public abstract class AbstractBytesToBytesMapSuite {
   @Test
   public void initialCapacityBoundsChecking() {
     try {
-      new BytesToBytesMap(taskMemoryManager, 0, PAGE_SIZE_BYTES);
+      new BytesToBytesMap(taskMemoryManager, 0, PAGE_SIZE_BYTES, shuffleFileSystem);
       Assert.fail("Expected IllegalArgumentException to be thrown");
     } catch (IllegalArgumentException e) {
       // expected exception
@@ -619,7 +632,8 @@ public abstract class AbstractBytesToBytesMapSuite {
       new BytesToBytesMap(
         taskMemoryManager,
         BytesToBytesMap.MAX_CAPACITY + 1,
-        PAGE_SIZE_BYTES);
+        PAGE_SIZE_BYTES,
+        shuffleFileSystem);
       Assert.fail("Expected IllegalArgumentException to be thrown");
     } catch (IllegalArgumentException e) {
       // expected exception
@@ -631,7 +645,7 @@ public abstract class AbstractBytesToBytesMapSuite {
     final long recordLengthBytes = 32;
     final long pageSizeBytes = 256 + 8; // 8 bytes for end-of-page marker
     final long numRecordsPerPage = (pageSizeBytes - 8) / recordLengthBytes;
-    final BytesToBytesMap map = new BytesToBytesMap(taskMemoryManager, 1024, pageSizeBytes);
+    final BytesToBytesMap map = new BytesToBytesMap(taskMemoryManager, 1024, pageSizeBytes, shuffleFileSystem);
 
     // Since BytesToBytesMap is append-only, we expect the total memory consumption to be
     // monotonically increasing. More specifically, every time we allocate a new page it
@@ -675,7 +689,7 @@ public abstract class AbstractBytesToBytesMapSuite {
     MemoryMode mode = useOffHeapMemoryAllocator() ? MemoryMode.OFF_HEAP: MemoryMode.ON_HEAP;
     TestMemoryConsumer c1 = new TestMemoryConsumer(taskMemoryManager, mode);
     BytesToBytesMap map =
-      new BytesToBytesMap(taskMemoryManager, blockManager, serializerManager, 1, 0.5, 1024, false);
+      new BytesToBytesMap(taskMemoryManager, serializerManager, 1, 0.5, 1024, false, shuffleFileSystem);
 
     Thread thread = new Thread(() -> {
       int i = 0;
@@ -707,9 +721,9 @@ public abstract class AbstractBytesToBytesMapSuite {
     } finally {
       map.free();
       thread.join();
-      for (File spillFile : spillFilesCreated) {
+      for (URI spillFile : spillFilesCreated) {
         assertFalse("Spill file " + spillFile.getPath() + " was not cleaned up",
-          spillFile.exists());
+          shuffleFileSystem.exists(spillFile));
       }
     }
   }

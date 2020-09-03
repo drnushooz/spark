@@ -18,14 +18,15 @@
 package org.apache.spark.util.collection.unsafe.sort;
 
 import javax.annotation.Nullable;
-import java.io.File;
 import java.io.IOException;
+import java.net.URI;
 import java.util.LinkedList;
 import java.util.Queue;
 import java.util.function.Supplier;
 
 import com.google.common.annotations.VisibleForTesting;
 import org.apache.spark.memory.SparkOutOfMemoryError;
+import org.apache.spark.storage.ShuffleFileSystem;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
@@ -35,7 +36,6 @@ import org.apache.spark.memory.MemoryConsumer;
 import org.apache.spark.memory.TaskMemoryManager;
 import org.apache.spark.memory.TooLargePageException;
 import org.apache.spark.serializer.SerializerManager;
-import org.apache.spark.storage.BlockManager;
 import org.apache.spark.unsafe.Platform;
 import org.apache.spark.unsafe.UnsafeAlignedOffset;
 import org.apache.spark.unsafe.array.LongArray;
@@ -62,9 +62,9 @@ public final class UnsafeExternalSorter extends MemoryConsumer {
   private final Supplier<RecordComparator> recordComparatorSupplier;
 
   private final TaskMemoryManager taskMemoryManager;
-  private final BlockManager blockManager;
   private final SerializerManager serializerManager;
   private final TaskContext taskContext;
+  private final ShuffleFileSystem shuffleFileSystem;
 
   /** The buffer size to use when writing spills using DiskBlockObjectWriter */
   private final int fileBufferSizeBytes;
@@ -96,7 +96,6 @@ public final class UnsafeExternalSorter extends MemoryConsumer {
 
   public static UnsafeExternalSorter createWithExistingInMemorySorter(
       TaskMemoryManager taskMemoryManager,
-      BlockManager blockManager,
       SerializerManager serializerManager,
       TaskContext taskContext,
       Supplier<RecordComparator> recordComparatorSupplier,
@@ -104,10 +103,11 @@ public final class UnsafeExternalSorter extends MemoryConsumer {
       int initialSize,
       long pageSizeBytes,
       int numElementsForSpillThreshold,
-      UnsafeInMemorySorter inMemorySorter) throws IOException {
-    UnsafeExternalSorter sorter = new UnsafeExternalSorter(taskMemoryManager, blockManager,
+      UnsafeInMemorySorter inMemorySorter,
+      ShuffleFileSystem shuffleFileSystem) throws IOException {
+    UnsafeExternalSorter sorter = new UnsafeExternalSorter(taskMemoryManager,
       serializerManager, taskContext, recordComparatorSupplier, prefixComparator, initialSize,
-        pageSizeBytes, numElementsForSpillThreshold, inMemorySorter, false /* ignored */);
+        pageSizeBytes, numElementsForSpillThreshold, inMemorySorter, false /* ignored */, shuffleFileSystem);
     sorter.spill(Long.MAX_VALUE, sorter);
     // The external sorter will be used to insert records, in-memory sorter is not needed.
     sorter.inMemSorter = null;
@@ -116,7 +116,6 @@ public final class UnsafeExternalSorter extends MemoryConsumer {
 
   public static UnsafeExternalSorter create(
       TaskMemoryManager taskMemoryManager,
-      BlockManager blockManager,
       SerializerManager serializerManager,
       TaskContext taskContext,
       Supplier<RecordComparator> recordComparatorSupplier,
@@ -124,15 +123,15 @@ public final class UnsafeExternalSorter extends MemoryConsumer {
       int initialSize,
       long pageSizeBytes,
       int numElementsForSpillThreshold,
-      boolean canUseRadixSort) {
-    return new UnsafeExternalSorter(taskMemoryManager, blockManager, serializerManager,
+      boolean canUseRadixSort,
+      ShuffleFileSystem shuffleFileSystem) {
+    return new UnsafeExternalSorter(taskMemoryManager, serializerManager,
       taskContext, recordComparatorSupplier, prefixComparator, initialSize, pageSizeBytes,
-      numElementsForSpillThreshold, null, canUseRadixSort);
+      numElementsForSpillThreshold, null, canUseRadixSort, shuffleFileSystem);
   }
 
   private UnsafeExternalSorter(
       TaskMemoryManager taskMemoryManager,
-      BlockManager blockManager,
       SerializerManager serializerManager,
       TaskContext taskContext,
       Supplier<RecordComparator> recordComparatorSupplier,
@@ -141,10 +140,10 @@ public final class UnsafeExternalSorter extends MemoryConsumer {
       long pageSizeBytes,
       int numElementsForSpillThreshold,
       @Nullable UnsafeInMemorySorter existingInMemorySorter,
-      boolean canUseRadixSort) {
+      boolean canUseRadixSort,
+      ShuffleFileSystem shuffleFileSystem) {
     super(taskMemoryManager, pageSizeBytes, taskMemoryManager.getTungstenMemoryMode());
     this.taskMemoryManager = taskMemoryManager;
-    this.blockManager = blockManager;
     this.serializerManager = serializerManager;
     this.taskContext = taskContext;
     this.recordComparatorSupplier = recordComparatorSupplier;
@@ -170,6 +169,7 @@ public final class UnsafeExternalSorter extends MemoryConsumer {
     }
     this.peakMemoryUsedBytes = getMemoryUsage();
     this.numElementsForSpillThreshold = numElementsForSpillThreshold;
+    this.shuffleFileSystem = shuffleFileSystem;
 
     // Register a cleanup task with TaskContext to ensure that memory is guaranteed to be freed at
     // the end of the task. This is necessary to avoid memory leaks in when the downstream operator
@@ -216,8 +216,8 @@ public final class UnsafeExternalSorter extends MemoryConsumer {
     // We only write out contents of the inMemSorter if it is not empty.
     if (inMemSorter.numRecords() > 0) {
       final UnsafeSorterSpillWriter spillWriter =
-        new UnsafeSorterSpillWriter(blockManager, fileBufferSizeBytes, writeMetrics,
-          inMemSorter.numRecords());
+        new UnsafeSorterSpillWriter( fileBufferSizeBytes, writeMetrics,
+          inMemSorter.numRecords(), shuffleFileSystem);
       spillWriters.add(spillWriter);
       spillIterator(inMemSorter.getSortedIterator(), spillWriter);
     }
@@ -310,10 +310,10 @@ public final class UnsafeExternalSorter extends MemoryConsumer {
    */
   private void deleteSpillFiles() {
     for (UnsafeSorterSpillWriter spill : spillWriters) {
-      File file = spill.getFile();
-      if (file != null && file.exists()) {
-        if (!file.delete()) {
-          logger.error("Was unable to delete spill file {}", file.getAbsolutePath());
+      URI file = spill.getFile();
+      if (file != null && shuffleFileSystem.exists(file)) {
+        if (!shuffleFileSystem.delete(file)) {
+          logger.error("Was unable to delete spill file {}", file.getPath());
         }
       }
     }
@@ -533,7 +533,7 @@ public final class UnsafeExternalSorter extends MemoryConsumer {
        ShuffleWriteMetrics writeMetrics = new ShuffleWriteMetrics();
         // Iterate over the records that have not been returned and spill them.
         final UnsafeSorterSpillWriter spillWriter =
-          new UnsafeSorterSpillWriter(blockManager, fileBufferSizeBytes, writeMetrics, numRecords);
+          new UnsafeSorterSpillWriter(fileBufferSizeBytes, writeMetrics, numRecords, shuffleFileSystem);
         spillIterator(inMemIterator, spillWriter);
         spillWriters.add(spillWriter);
         nextUpstream = spillWriter.getReader(serializerManager);

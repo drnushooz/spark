@@ -27,6 +27,7 @@ import org.apache.spark.sql.execution.joins.LongToUnsafeRowMap
 import org.apache.spark.sql.execution.vectorized.AggregateHashMap
 import org.apache.spark.sql.internal.SQLConf
 import org.apache.spark.sql.types.{LongType, StructType}
+import org.apache.spark.storage.ShuffleFileSystem
 import org.apache.spark.unsafe.Platform
 import org.apache.spark.unsafe.hash.Murmur3_x86_32
 import org.apache.spark.unsafe.map.BytesToBytesMap
@@ -576,7 +577,7 @@ class AggregateBenchmark extends BenchmarkBase {
             Long.MaxValue,
             1),
           0)
-        val map = new BytesToBytesMap(taskMemoryManager, 1024, 64L<<20)
+        val map = new BytesToBytesMap(taskMemoryManager, 1024, 64L<<20, ShuffleFileSystem())
         val keyBytes = new Array[Byte](16)
         val valueBytes = new Array[Byte](16)
         val key = new UnsafeRow(1)

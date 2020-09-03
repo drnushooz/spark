@@ -17,6 +17,7 @@
 
 package org.apache.spark.shuffle
 
+import org.apache.spark.storage.ShuffleFileSystem
 import org.apache.spark.{ShuffleDependency, TaskContext}
 
 /**

@@ -33,7 +33,6 @@ import scala.util.Random
 import scala.util.control.NonFatal
 
 import com.codahale.metrics.{MetricRegistry, MetricSet}
-import com.google.common.io.CountingOutputStream
 
 import org.apache.spark._
 import org.apache.spark.executor.{DataReadMethod, ShuffleWriteMetrics}
@@ -128,7 +127,8 @@ private[spark] class BlockManager(
     shuffleManager: ShuffleManager,
     val blockTransferService: BlockTransferService,
     securityManager: SecurityManager,
-    numUsableCores: Int)
+    numUsableCores: Int,
+    shuffleFileSystem: ShuffleFileSystem = ShuffleFileSystem())
   extends BlockDataManager with BlockEvictionHandler with Logging {
 
   private[spark] val externalShuffleServiceEnabled =
@@ -934,8 +934,8 @@ private[spark] class BlockManager(
       bufferSize: Int,
       writeMetrics: ShuffleWriteMetrics): DiskBlockObjectWriter = {
     val syncWrites = conf.getBoolean("spark.shuffle.sync", false)
-    new DiskBlockObjectWriter(file, serializerManager, serializerInstance, bufferSize,
-      syncWrites, writeMetrics, blockId)
+    new DiskBlockObjectWriter(file.toURI, serializerManager, serializerInstance, bufferSize,
+      syncWrites, writeMetrics, blockId, shuffleFileSystem)
   }
 
   /**

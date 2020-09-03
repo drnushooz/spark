@@ -29,11 +29,14 @@ import org.apache.spark.sql.catalyst.InternalRow
 import org.apache.spark.sql.catalyst.expressions._
 import org.apache.spark.sql.test.SharedSQLContext
 import org.apache.spark.sql.types._
+import org.apache.spark.storage.LocalShuffleFileSystem
 import org.apache.spark.unsafe.map.BytesToBytesMap
 import org.apache.spark.unsafe.types.UTF8String
 import org.apache.spark.util.collection.CompactBuffer
 
 class HashedRelationSuite extends SparkFunSuite with SharedSQLContext {
+
+  val shuffleFileSystem = new LocalShuffleFileSystem
 
   val mm = new TaskMemoryManager(
     new StaticMemoryManager(
@@ -91,7 +94,7 @@ class HashedRelationSuite extends SparkFunSuite with SharedSQLContext {
         Long.MaxValue,
         1),
       0)
-    val binaryMap = new BytesToBytesMap(taskMemoryManager, 1, 1)
+    val binaryMap = new BytesToBytesMap(taskMemoryManager, 1, 1, shuffleFileSystem)
     val os = new ByteArrayOutputStream()
     val out = new ObjectOutputStream(os)
     val hashed = new UnsafeHashedRelation(1, binaryMap)

@@ -17,19 +17,16 @@
 
 package org.apache.spark.util.collection.unsafe.sort;
 
-import java.io.File;
 import java.io.IOException;
+import java.net.URI;
 
+import org.apache.spark.storage.*;
 import scala.Tuple2;
 
 import org.apache.spark.SparkConf;
 import org.apache.spark.serializer.SerializerManager;
 import org.apache.spark.executor.ShuffleWriteMetrics;
 import org.apache.spark.serializer.DummySerializerInstance;
-import org.apache.spark.storage.BlockId;
-import org.apache.spark.storage.BlockManager;
-import org.apache.spark.storage.DiskBlockObjectWriter;
-import org.apache.spark.storage.TempLocalBlockId;
 import org.apache.spark.unsafe.Platform;
 import org.apache.spark.internal.config.package$;
 
@@ -51,27 +48,29 @@ public final class UnsafeSorterSpillWriter {
   // data through a byte array.
   private byte[] writeBuffer = new byte[diskWriteBufferSize];
 
-  private final File file;
+  private final URI file;
   private final BlockId blockId;
   private final int numRecordsToWrite;
   private DiskBlockObjectWriter writer;
   private int numRecordsSpilled = 0;
+  private final ShuffleFileSystem shuffleFileSystem;
 
   public UnsafeSorterSpillWriter(
-      BlockManager blockManager,
       int fileBufferSize,
       ShuffleWriteMetrics writeMetrics,
-      int numRecordsToWrite) throws IOException {
-    final Tuple2<TempLocalBlockId, File> spilledFileInfo =
-      blockManager.diskBlockManager().createTempLocalBlock();
+      int numRecordsToWrite,
+      ShuffleFileSystem shuffleFileSystem) throws IOException {
+    final Tuple2<TempLocalBlockId, URI> spilledFileInfo =
+      shuffleFileSystem.createTempLocalBlock();
     this.file = spilledFileInfo._2();
     this.blockId = spilledFileInfo._1();
     this.numRecordsToWrite = numRecordsToWrite;
+    this.shuffleFileSystem = shuffleFileSystem;
     // Unfortunately, we need a serializer instance in order to construct a DiskBlockObjectWriter.
     // Our write path doesn't actually use this serializer (since we end up calling the `write()`
     // OutputStream methods), but DiskBlockObjectWriter still calls some methods on it. To work
     // around this, we pass a dummy no-op serializer.
-    writer = blockManager.getDiskWriter(
+    writer = shuffleFileSystem.getDiskWriter(
       blockId, file, DummySerializerInstance.INSTANCE, fileBufferSize, writeMetrics);
     // Write the number of records
     writeIntToBuffer(numRecordsToWrite, 0);
@@ -148,12 +147,12 @@ public final class UnsafeSorterSpillWriter {
     writeBuffer = null;
   }
 
-  public File getFile() {
+  public URI getFile() {
     return file;
   }
 
   public UnsafeSorterSpillReader getReader(SerializerManager serializerManager) throws IOException {
-    return new UnsafeSorterSpillReader(serializerManager, file, blockId);
+    return new UnsafeSorterSpillReader(serializerManager, file, blockId, shuffleFileSystem);
   }
 
   public int recordsSpilled() {

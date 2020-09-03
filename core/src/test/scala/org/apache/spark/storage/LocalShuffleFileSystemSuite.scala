@@ -15,23 +15,11 @@
  * limitations under the License.
  */
 
-package org.apache.spark.shuffle.sort;
+package org.apache.spark.storage
 
-import java.net.URI;
-
-import org.apache.spark.storage.TempShuffleBlockId;
-
-/**
- * Metadata for a block of data written by {@link ShuffleExternalSorter}.
- */
-final class SpillInfo {
-  final long[] partitionLengths;
-  final URI file;
-  final TempShuffleBlockId blockId;
-
-  SpillInfo(int numPartitions, URI file, TempShuffleBlockId blockId) {
-    this.partitionLengths = new long[numPartitions];
-    this.file = file;
-    this.blockId = blockId;
+private class LocalShuffleFileSystemSuite extends ShuffleFileSystemTestBase {
+  override def beforeAll(): Unit = {
+    super.beforeAll()
+    shuffleFileSystem = new LocalShuffleFileSystem
   }
 }

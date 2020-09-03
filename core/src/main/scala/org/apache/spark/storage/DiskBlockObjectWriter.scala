@@ -17,10 +17,11 @@
 
 package org.apache.spark.storage
 
-import java.io.{BufferedOutputStream, File, FileOutputStream, OutputStream}
-import java.nio.channels.FileChannel
+import java.io.{BufferedOutputStream, OutputStream}
+import java.net.URI
 
 import org.apache.spark.executor.ShuffleWriteMetrics
+import org.apache.hadoop.fs.FSDataOutputStream
 import org.apache.spark.internal.Logging
 import org.apache.spark.serializer.{SerializationStream, SerializerInstance, SerializerManager}
 import org.apache.spark.util.Utils
@@ -36,7 +37,7 @@ import org.apache.spark.util.Utils
  * reopened again.
  */
 private[spark] class DiskBlockObjectWriter(
-    val file: File,
+    val file: URI,
     serializerManager: SerializerManager,
     serializerInstance: SerializerInstance,
     bufferSize: Int,
@@ -44,7 +45,8 @@ private[spark] class DiskBlockObjectWriter(
     // These write metrics concurrently shared with other active DiskBlockObjectWriters who
     // are themselves performing writes. All updates must be relative.
     writeMetrics: ShuffleWriteMetrics,
-    val blockId: BlockId = null)
+    val blockId: BlockId = null,
+    shuffleFileSystem: ShuffleFileSystem = new LocalShuffleFileSystem)
   extends OutputStream
   with Logging {
 
@@ -65,10 +67,10 @@ private[spark] class DiskBlockObjectWriter(
   }
 
   /** The file channel, used for repositioning / truncating the file. */
-  private var channel: FileChannel = null
+  private var channel = null
   private var mcs: ManualCloseOutputStream = null
   private var bs: OutputStream = null
-  private var fos: FileOutputStream = null
+  private var fos: FSDataOutputStream = null
   private var ts: TimeTrackingOutputStream = null
   private var objOut: SerializationStream = null
   private var initialized = false
@@ -80,7 +82,7 @@ private[spark] class DiskBlockObjectWriter(
    *
    * xxxxxxxxxx|----------|-----|
    *           ^          ^     ^
-   *           |          |    channel.position()
+   *           |          |    fos.getPos()
    *           |        reportedPosition
    *         committedPosition
    *
@@ -89,7 +91,7 @@ private[spark] class DiskBlockObjectWriter(
    * -----: Current writes to the underlying file.
    * xxxxx: Committed contents of the file.
    */
-  private var committedPosition = file.length()
+  private var committedPosition = getFileSize
   private var reportedPosition = committedPosition
 
   /**
@@ -99,9 +101,16 @@ private[spark] class DiskBlockObjectWriter(
    */
   private var numRecordsWritten = 0
 
+  private def getFileSize: Long = {
+    shuffleFileSystem.getFileSize(file)
+  }
+
+  private def logStats(): Unit = {
+    logDebug("File = %s : Positions = %d:%d".format(file, committedPosition, reportedPosition))
+  }
+
   private def initialize(): Unit = {
-    fos = new FileOutputStream(file, true)
-    channel = fos.getChannel()
+    fos = shuffleFileSystem.create(file, append = true)
     ts = new TimeTrackingOutputStream(writeMetrics, fos)
     class ManualCloseBufferedOutputStream
       extends BufferedOutputStream(ts, bufferSize) with ManualCloseOutputStream
@@ -120,6 +129,7 @@ private[spark] class DiskBlockObjectWriter(
     bs = serializerManager.wrapStream(blockId, mcs)
     objOut = serializerInstance.serializeStream(bs)
     streamOpen = true
+    logStats()
     this
   }
 
@@ -176,11 +186,11 @@ private[spark] class DiskBlockObjectWriter(
       if (syncWrites) {
         // Force outstanding writes to disk and track how long it takes
         val start = System.nanoTime()
-        fos.getFD.sync()
+        fos.hsync()
         writeMetrics.incWriteTime(System.nanoTime() - start)
       }
 
-      val pos = channel.position()
+      val pos = fos.getPos
       val fileSegment = new FileSegment(file, committedPosition, pos - committedPosition)
       committedPosition = pos
       // In certain compression codecs, more bytes are written after streams are closed
@@ -199,9 +209,9 @@ private[spark] class DiskBlockObjectWriter(
    * when there are runtime exceptions. This method will not throw, though it may be
    * unsuccessful in truncating written data.
    *
-   * @return the file that this DiskBlockObjectWriter wrote to.
+   * @return the URI of the file that this DiskBlockObjectWriter wrote to.
    */
-  def revertPartialWritesAndClose(): File = {
+  def revertPartialWritesAndClose(): URI = {
     // Discard current writes. We do this by flushing the outstanding writes and then
     // truncating the file to its initial position.
     Utils.tryWithSafeFinally {
@@ -212,18 +222,11 @@ private[spark] class DiskBlockObjectWriter(
         closeResources()
       }
     } {
-      var truncateStream: FileOutputStream = null
       try {
-        truncateStream = new FileOutputStream(file, true)
-        truncateStream.getChannel.truncate(committedPosition)
+        shuffleFileSystem.truncate(file, committedPosition)
       } catch {
         case e: Exception =>
           logError("Uncaught exception while reverting partial writes to file " + file, e)
-      } finally {
-        if (truncateStream != null) {
-          truncateStream.close()
-          truncateStream = null
-        }
       }
     }
     file
@@ -269,7 +272,7 @@ private[spark] class DiskBlockObjectWriter(
    * Note that this is only valid before the underlying streams are closed.
    */
   private def updateBytesWritten() {
-    val pos = channel.position()
+    val pos = fos.getPos
     writeMetrics.incBytesWritten(pos - reportedPosition)
     reportedPosition = pos
   }

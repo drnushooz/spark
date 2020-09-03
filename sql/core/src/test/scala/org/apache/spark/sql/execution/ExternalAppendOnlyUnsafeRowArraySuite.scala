@@ -40,7 +40,6 @@ class ExternalAppendOnlyUnsafeRowArraySuite extends SparkFunSuite with LocalSpar
 
     val array = new ExternalAppendOnlyUnsafeRowArray(
       taskContext.taskMemoryManager(),
-      SparkEnv.get.blockManager,
       SparkEnv.get.serializerManager,
       taskContext,
       1024,

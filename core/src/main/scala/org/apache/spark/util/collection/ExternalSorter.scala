@@ -18,18 +18,18 @@
 package org.apache.spark.util.collection
 
 import java.io._
-import java.util.Comparator
+import java.net.URI
+import java.util.{Comparator, UUID}
 
-import scala.collection.mutable
-import scala.collection.mutable.ArrayBuffer
-
-import com.google.common.io.ByteStreams
-
+import org.apache.hadoop.fs.FSDataInputStream
 import org.apache.spark._
 import org.apache.spark.executor.ShuffleWriteMetrics
 import org.apache.spark.internal.Logging
 import org.apache.spark.serializer._
-import org.apache.spark.storage.{BlockId, DiskBlockObjectWriter}
+import org.apache.spark.storage._
+
+import scala.collection.mutable
+import scala.collection.mutable.ArrayBuffer
 
 /**
  * Sorts and potentially merges a number of key-value pairs of type (K, V) to produce key-combiner
@@ -91,7 +91,8 @@ private[spark] class ExternalSorter[K, V, C](
     aggregator: Option[Aggregator[K, V, C]] = None,
     partitioner: Option[Partitioner] = None,
     ordering: Option[Ordering[K]] = None,
-    serializer: Serializer = SparkEnv.get.serializer)
+    serializer: Serializer = SparkEnv.get.serializer,
+    shuffleFileSystem: ShuffleFileSystem = new LocalShuffleFileSystem)
   extends Spillable[WritablePartitionedPairCollection[K, C]](context.taskMemoryManager())
   with Logging {
 
@@ -103,8 +104,6 @@ private[spark] class ExternalSorter[K, V, C](
     if (shouldPartition) partitioner.get.getPartition(key) else 0
   }
 
-  private val blockManager = SparkEnv.get.blockManager
-  private val diskBlockManager = blockManager.diskBlockManager
   private val serializerManager = SparkEnv.get.serializerManager
   private val serInstance = serializer.newInstance()
 
@@ -163,7 +162,7 @@ private[spark] class ExternalSorter[K, V, C](
   // serializer as we periodically reset its stream, as well as number of elements in each
   // partition, used to efficiently keep track of partitions when merging.
   private[this] case class SpilledFile(
-    file: File,
+    file: URI,
     blockId: BlockId,
     serializerBatchSizes: Array[Long],
     elementsPerPartition: Array[Long])
@@ -267,13 +266,13 @@ private[spark] class ExternalSorter[K, V, C](
     // Because these files may be read during shuffle, their compression must be controlled by
     // spark.shuffle.compress instead of spark.shuffle.spill.compress, so we need to use
     // createTempShuffleBlock here; see SPARK-3426 for more context.
-    val (blockId, file) = diskBlockManager.createTempShuffleBlock()
+    val (blockId, file) = createTempShuffleBlock()
 
     // These variables are reset after each flush
     var objectsWritten: Long = 0
     val spillMetrics: ShuffleWriteMetrics = new ShuffleWriteMetrics
     val writer: DiskBlockObjectWriter =
-      blockManager.getDiskWriter(blockId, file, serInstance, fileBufferSize, spillMetrics)
+      shuffleFileSystem.getDiskWriter(blockId, file, serializer.newInstance(), fileBufferSize, spillMetrics)
 
     // List of batch sizes (bytes) in the order they are written to disk
     val batchSizes = new ArrayBuffer[Long]
@@ -317,8 +316,8 @@ private[spark] class ExternalSorter[K, V, C](
         // This code path only happens if an exception was thrown above before we set success;
         // close our stuff and let the exception be thrown further
         writer.revertPartialWritesAndClose()
-        if (file.exists()) {
-          if (!file.delete()) {
+        if (shuffleFileSystem.exists(file)) {
+          if (!shuffleFileSystem.delete(file)) {
             logWarning(s"Error deleting ${file}")
           }
         }
@@ -326,6 +325,19 @@ private[spark] class ExternalSorter[K, V, C](
     }
 
     SpilledFile(file, blockId, batchSizes.toArray, elementsPerPartition)
+  }
+
+  /** Produces a unique block id and File suitable for storing shuffled intermediate results. */
+  def createTempShuffleBlock(): (TempShuffleBlockId, URI) = {
+    var blockId: TempShuffleBlockId = null
+    var uri: URI = null
+
+    do {
+      blockId = TempShuffleBlockId(UUID.randomUUID())
+      uri = shuffleFileSystem.getTempFilePath(blockId.name)
+    } while (shuffleFileSystem.exists(uri))
+
+    (blockId, uri)
   }
 
   /**
@@ -492,7 +504,7 @@ private[spark] class ExternalSorter[K, V, C](
 
     // Intermediate file and deserializer streams that read from exactly one batch
     // This guards against pre-fetching and other arbitrary behavior of higher level streams
-    var fileStream: FileInputStream = null
+    var fileStream: FSDataInputStream = null
     var deserializeStream = nextBatchStream()  // Also sets fileStream
 
     var nextItem: (K, C) = null
@@ -511,8 +523,8 @@ private[spark] class ExternalSorter[K, V, C](
         }
 
         val start = batchOffsets(batchId)
-        fileStream = new FileInputStream(spill.file)
-        fileStream.getChannel.position(start)
+        fileStream = shuffleFileSystem.open(spill.file)
+        fileStream.seek(start)
         batchId += 1
 
         val end = batchOffsets(batchId)
@@ -520,7 +532,7 @@ private[spark] class ExternalSorter[K, V, C](
         assert(end >= start, "start = " + start + ", end = " + end +
           ", batchOffsets = " + batchOffsets.mkString("[", ", ", "]"))
 
-        val bufferedStream = new BufferedInputStream(ByteStreams.limit(fileStream, end - start))
+        val bufferedStream = new BufferedInputStream(shuffleFileSystem.getBoundedStream(fileStream, end - start))
 
         val wrappedStream = serializerManager.wrapStream(spill.blockId, bufferedStream)
         serInstance.deserializeStream(wrappedStream)
@@ -682,11 +694,11 @@ private[spark] class ExternalSorter[K, V, C](
    */
   def writePartitionedFile(
       blockId: BlockId,
-      outputFile: File): Array[Long] = {
+      outputFile: URI): Array[Long] = {
 
     // Track location of each range in the output file
     val lengths = new Array[Long](numPartitions)
-    val writer = blockManager.getDiskWriter(blockId, outputFile, serInstance, fileBufferSize,
+    val writer = shuffleFileSystem.getDiskWriter(blockId, outputFile, serializer.newInstance(), fileBufferSize,
       context.taskMetrics().shuffleWriteMetrics)
 
     if (spills.isEmpty) {
@@ -723,9 +735,9 @@ private[spark] class ExternalSorter[K, V, C](
   }
 
   def stop(): Unit = {
-    spills.foreach(s => s.file.delete())
+    spills.foreach(s => shuffleFileSystem.delete(s.file))
     spills.clear()
-    forceSpillFiles.foreach(s => s.file.delete())
+    forceSpillFiles.foreach(s => shuffleFileSystem.delete(s.file))
     forceSpillFiles.clear()
     if (map != null || buffer != null || readingIterator != null) {
       map = null // So that the memory can be garbage-collected

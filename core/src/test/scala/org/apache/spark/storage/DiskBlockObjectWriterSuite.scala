@@ -48,7 +48,7 @@ class DiskBlockObjectWriterSuite extends SparkFunSuite with BeforeAndAfterEach {
     val serializerManager = new SerializerManager(new JavaSerializer(conf), conf)
     val writeMetrics = new ShuffleWriteMetrics()
     val writer = new DiskBlockObjectWriter(
-      file, serializerManager, new JavaSerializer(new SparkConf()).newInstance(), 1024, true,
+      file.toURI, serializerManager, new JavaSerializer(new SparkConf()).newInstance(), 1024, true,
       writeMetrics)
     (writer, file, writeMetrics)
   }

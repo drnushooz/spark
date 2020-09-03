@@ -21,10 +21,10 @@ import java.lang.{Long => JLong}
 
 import org.mockito.Mockito.when
 import org.scalatest.mockito.MockitoSugar
-
 import org.apache.spark._
 import org.apache.spark.executor.{ShuffleWriteMetrics, TaskMetrics}
 import org.apache.spark.memory._
+import org.apache.spark.storage.LocalShuffleFileSystem
 import org.apache.spark.unsafe.Platform
 
 class ShuffleExternalSorterSuite extends SparkFunSuite with LocalSparkContext with MockitoSugar {
@@ -68,12 +68,12 @@ class ShuffleExternalSorterSuite extends SparkFunSuite with LocalSparkContext wi
     when(taskContext.taskMetrics()).thenReturn(taskMetrics)
     val sorter = new ShuffleExternalSorter(
       taskMemoryManager,
-      sc.env.blockManager,
       taskContext,
       100, // initialSize - This will require ShuffleInMemorySorter to acquire at least 800 bytes
       1, // numPartitions
       conf,
-      new ShuffleWriteMetrics)
+      new ShuffleWriteMetrics,
+      new LocalShuffleFileSystem)
     val inMemSorter = {
       val field = sorter.getClass.getDeclaredField("inMemSorter")
       field.setAccessible(true)

@@ -20,7 +20,6 @@ package org.apache.spark.sql.execution
 import java.util.Properties
 
 import scala.util.Random
-
 import org.apache.spark._
 import org.apache.spark.internal.config._
 import org.apache.spark.memory.{TaskMemoryManager, TestMemoryManager}
@@ -29,12 +28,16 @@ import org.apache.spark.sql.catalyst.{CatalystTypeConverters, InternalRow}
 import org.apache.spark.sql.catalyst.expressions.{InterpretedOrdering, UnsafeProjection, UnsafeRow}
 import org.apache.spark.sql.test.SharedSQLContext
 import org.apache.spark.sql.types._
+import org.apache.spark.storage.LocalShuffleFileSystem
 import org.apache.spark.unsafe.map.BytesToBytesMap
 
 /**
  * Test suite for [[UnsafeKVExternalSorter]], with randomly generated test data.
  */
 class UnsafeKVExternalSorterSuite extends SparkFunSuite with SharedSQLContext {
+
+  private val shuffleFileSystem = new LocalShuffleFileSystem
+
   private val keyTypes = Seq(IntegerType, FloatType, DoubleType, StringType)
   private val valueTypes = Seq(IntegerType, FloatType, DoubleType, StringType)
 
@@ -126,7 +129,7 @@ class UnsafeKVExternalSorterSuite extends SparkFunSuite with SharedSQLContext {
       metricsSystem = null))
 
     val sorter = new UnsafeKVExternalSorter(
-      keySchema, valueSchema, SparkEnv.get.blockManager, SparkEnv.get.serializerManager,
+      keySchema, valueSchema, SparkEnv.get.serializerManager,
       pageSize, SHUFFLE_SPILL_NUM_ELEMENTS_FORCE_SPILL_THRESHOLD.defaultValue.get)
 
     // Insert the keys and values into the sorter
@@ -210,7 +213,7 @@ class UnsafeKVExternalSorterSuite extends SparkFunSuite with SharedSQLContext {
   test("SPARK-23376: Create UnsafeKVExternalSorter with BytesToByteMap having duplicated keys") {
     val memoryManager = new TestMemoryManager(new SparkConf())
     val taskMemoryManager = new TaskMemoryManager(memoryManager, 0)
-    val map = new BytesToBytesMap(taskMemoryManager, 64, taskMemoryManager.pageSizeBytes())
+    val map = new BytesToBytesMap(taskMemoryManager, 64, taskMemoryManager.pageSizeBytes(), shuffleFileSystem)
 
     // Key/value are a unsafe rows with a single int column
     val schema = new StructType().add("i", IntegerType)
@@ -236,7 +239,6 @@ class UnsafeKVExternalSorterSuite extends SparkFunSuite with SharedSQLContext {
       new UnsafeKVExternalSorter(
         schema,
         schema,
-        sparkContext.env.blockManager,
         sparkContext.env.serializerManager,
         taskMemoryManager.pageSizeBytes(),
         Int.MaxValue,

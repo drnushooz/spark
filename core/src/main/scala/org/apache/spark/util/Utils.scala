@@ -65,6 +65,8 @@ import org.apache.spark.launcher.SparkLauncher
 import org.apache.spark.network.util.JavaUtils
 import org.apache.spark.serializer.{DeserializationStream, SerializationStream, SerializerInstance}
 import org.apache.spark.status.api.v1.{StackTrace, ThreadStackTrace}
+import org.apache.spark.storage.ShuffleFileSystem
+import org.apache.spark.util.io.ChunkedByteBufferOutputStream
 
 /** CallSite represents a place in user code. It can have a short and a long form. */
 private[spark] case class CallSite(shortForm: String, longForm: String)
@@ -331,6 +333,44 @@ private[spark] object Utils extends Logging {
       namePrefix: String = "spark"): File = {
     val dir = createDirectory(root, namePrefix)
     ShutdownHookManager.registerShutdownDeleteDir(dir)
+    dir
+  }
+
+  /**
+    * Create a directory inside the given parent directory on a DFS. The directory is guaranteed to be
+    * newly created, and is not marked for automatic deletion.
+    */
+  def createDFSDirectory(root: String, shuffleFileSystem: ShuffleFileSystem, namePrefix: String = "spark"): URI = {
+    var attempts = 0
+    val maxAttempts = MAX_DIR_CREATION_ATTEMPTS
+    var dir: URI = null
+    while (dir == null) {
+      attempts += 1
+      if (attempts > maxAttempts) {
+        throw new IOException("Failed to create a temp directory (under " + root + ") after " +
+          maxAttempts + " attempts!")
+      }
+      try {
+        val rootAbsolutePath = shuffleFileSystem.getAbsolutePath(URI.create(root))
+        dir = URI.create(rootAbsolutePath + namePrefix + "-" + UUID.randomUUID.toString)
+        if (shuffleFileSystem.exists(dir) || !shuffleFileSystem.mkdirs(dir)) {
+          dir = null
+        }
+      } catch { case e: SecurityException => dir = null; }
+    }
+    shuffleFileSystem.getAbsolutePath(dir)
+  }
+
+  /**
+    * Create a temporary directory inside the given parent directory on a DFS. The directory will be
+    * automatically deleted when the VM shuts down.
+    */
+  def createTempDFSDir(
+      root: String = System.getProperty("java.io.tmpdir"),
+      namePrefix: String = "spark",
+      shuffleFileSystem: ShuffleFileSystem): URI = {
+    val dir = createDFSDirectory(root, shuffleFileSystem, namePrefix)
+    ShutdownHookManager.registerShutdownDeleteDFSDir(dir, shuffleFileSystem)
     dir
   }
 

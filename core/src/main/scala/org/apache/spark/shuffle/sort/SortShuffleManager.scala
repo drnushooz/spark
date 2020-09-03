@@ -22,6 +22,7 @@ import java.util.concurrent.ConcurrentHashMap
 import org.apache.spark._
 import org.apache.spark.internal.Logging
 import org.apache.spark.shuffle._
+import org.apache.spark.storage.ShuffleFileSystem
 
 /**
  * In sort-based shuffle, incoming records are sorted according to their target partition ids, then
@@ -78,8 +79,8 @@ private[spark] class SortShuffleManager(conf: SparkConf) extends ShuffleManager 
    * A mapping from shuffle ids to the number of mappers producing output for those shuffles.
    */
   private[this] val numMapsForShuffle = new ConcurrentHashMap[Int, Int]()
-
-  override val shuffleBlockResolver = new IndexShuffleBlockResolver(conf)
+  private lazy val shuffleFileSystem: ShuffleFileSystem = ShuffleFileSystem(conf)
+  override val shuffleBlockResolver = new IndexShuffleBlockResolver(conf, shuffleFileSystem)
 
   /**
    * Obtains a [[ShuffleHandle]] to pass to tasks.
@@ -116,7 +117,8 @@ private[spark] class SortShuffleManager(conf: SparkConf) extends ShuffleManager 
       endPartition: Int,
       context: TaskContext): ShuffleReader[K, C] = {
     new BlockStoreShuffleReader(
-      handle.asInstanceOf[BaseShuffleHandle[K, _, C]], startPartition, endPartition, context)
+      handle.asInstanceOf[BaseShuffleHandle[K, _, C]],
+      startPartition, endPartition, context, shuffleFileSystem = ShuffleFileSystem())
   }
 
   /** Get a writer for a given partition. Called on executors by map tasks. */
@@ -136,7 +138,8 @@ private[spark] class SortShuffleManager(conf: SparkConf) extends ShuffleManager 
           unsafeShuffleHandle,
           mapId,
           context,
-          env.conf)
+          env.conf,
+          shuffleFileSystem)
       case bypassMergeSortHandle: BypassMergeSortShuffleHandle[K @unchecked, V @unchecked] =>
         new BypassMergeSortShuffleWriter(
           env.blockManager,
@@ -144,9 +147,10 @@ private[spark] class SortShuffleManager(conf: SparkConf) extends ShuffleManager 
           bypassMergeSortHandle,
           mapId,
           context,
-          env.conf)
+          env.conf,
+          shuffleFileSystem)
       case other: BaseShuffleHandle[K @unchecked, V @unchecked, _] =>
-        new SortShuffleWriter(shuffleBlockResolver, other, mapId, context)
+        new SortShuffleWriter(shuffleBlockResolver, other, mapId, context, shuffleFileSystem)
     }
   }
 
@@ -163,6 +167,8 @@ private[spark] class SortShuffleManager(conf: SparkConf) extends ShuffleManager 
   /** Shut down this ShuffleManager. */
   override def stop(): Unit = {
     shuffleBlockResolver.stop()
+    if(shuffleFileSystem != null)
+      shuffleFileSystem.close
   }
 }
 

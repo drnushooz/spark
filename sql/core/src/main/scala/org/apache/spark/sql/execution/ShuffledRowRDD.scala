@@ -22,6 +22,7 @@ import java.util.Arrays
 import org.apache.spark._
 import org.apache.spark.rdd.RDD
 import org.apache.spark.sql.catalyst.InternalRow
+import org.apache.spark.storage.ShuffleFileSystem
 
 /**
  * The [[Partition]] used by [[ShuffledRowRDD]]. A post-shuffle partition

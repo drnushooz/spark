@@ -17,14 +17,15 @@
 
 package org.apache.spark.util
 
-import java.io.File
+import java.io.{File, FileNotFoundException}
+import java.net.URI
+import java.nio.file.NoSuchFileException
 import java.util.PriorityQueue
 
 import scala.util.Try
-
 import org.apache.hadoop.fs.FileSystem
-
 import org.apache.spark.internal.Logging
+import org.apache.spark.storage.ShuffleFileSystem
 
 /**
  * Various utility methods used by Spark.
@@ -52,6 +53,7 @@ private[spark] object ShutdownHookManager extends Logging {
   }
 
   private val shutdownDeletePaths = new scala.collection.mutable.HashSet[String]()
+  private val shutdownDeleteDFSPaths = new scala.collection.mutable.HashMap[URI, ShuffleFileSystem]()
 
   // Add a shutdown hook to delete the temp dirs when the JVM exits
   logDebug("Adding shutdown hook") // force eager creation of logger
@@ -65,6 +67,16 @@ private[spark] object ShutdownHookManager extends Logging {
         Utils.deleteRecursively(new File(dirPath))
       } catch {
         case e: Exception => logError(s"Exception while deleting Spark temp dir: $dirPath", e)
+      }
+    }
+    shutdownDeleteDFSPaths.toArray.foreach { case (dirPath, shuffleFS) =>
+      try {
+        logInfo("Deleting DFS directory " + dirPath)
+        shuffleFS.deleteRecursively(dirPath)
+      } catch {
+        case _: FileNotFoundException => () //Do nothing if the directory is already been removed
+        case _: NoSuchFileException => () //Do nothing if the directory is already been removed
+        case e: Exception => logError(s"Exception while deleting Spark temp DFS dir: $dirPath", e)
       }
     }
   }
@@ -90,6 +102,30 @@ private[spark] object ShutdownHookManager extends Logging {
     val absolutePath = file.getAbsolutePath()
     shutdownDeletePaths.synchronized {
       shutdownDeletePaths.contains(absolutePath)
+    }
+  }
+
+  // Register a DFS path to be deleted via shutdown hook
+  def registerShutdownDeleteDFSDir(file: URI, shuffleFileSystem: ShuffleFileSystem) {
+    val absolutePath = shuffleFileSystem.getAbsolutePath(file)
+    shutdownDeleteDFSPaths.synchronized {
+      shutdownDeleteDFSPaths += ((absolutePath, shuffleFileSystem))
+    }
+  }
+
+  // Remove a DFS path to be deleted via shutdown hook
+  def removeShutdownDeleteDFSDir(file: URI, shuffleFileSystem: ShuffleFileSystem) {
+    val absolutePath = shuffleFileSystem.getAbsolutePath(file)
+    shutdownDeleteDFSPaths.synchronized {
+      shutdownDeleteDFSPaths.remove(absolutePath)
+    }
+  }
+
+  // Is a DFS path already registered to be deleted via a shutdown hook ?
+  def hasShutdownDeleteDFSDir(file: URI, shuffleFileSystem: ShuffleFileSystem): Boolean = {
+    val absolutePath = shuffleFileSystem.getAbsolutePath(file)
+    shutdownDeleteDFSPaths.synchronized {
+      shutdownDeleteDFSPaths.contains(absolutePath)
     }
   }
 

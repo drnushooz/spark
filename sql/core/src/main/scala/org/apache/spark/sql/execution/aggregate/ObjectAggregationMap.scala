@@ -71,7 +71,6 @@ class ObjectAggregationMap() {
     val sorter = new UnsafeKVExternalSorter(
       StructType.fromAttributes(groupingAttributes),
       StructType.fromAttributes(aggBufferAttributes),
-      SparkEnv.get.blockManager,
       SparkEnv.get.serializerManager,
       TaskContext.get().taskMemoryManager().pageSizeBytes,
       SparkEnv.get.conf.get(config.SHUFFLE_SPILL_NUM_ELEMENTS_FORCE_SPILL_THRESHOLD),

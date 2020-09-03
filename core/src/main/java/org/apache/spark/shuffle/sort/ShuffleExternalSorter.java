@@ -18,8 +18,8 @@
 package org.apache.spark.shuffle.sort;
 
 import javax.annotation.Nullable;
-import java.io.File;
 import java.io.IOException;
+import java.net.URI;
 import java.util.LinkedList;
 
 import scala.Tuple2;
@@ -38,7 +38,6 @@ import org.apache.spark.memory.TaskMemoryManager;
 import org.apache.spark.memory.TooLargePageException;
 import org.apache.spark.serializer.DummySerializerInstance;
 import org.apache.spark.serializer.SerializerInstance;
-import org.apache.spark.storage.BlockManager;
 import org.apache.spark.storage.DiskBlockObjectWriter;
 import org.apache.spark.storage.FileSegment;
 import org.apache.spark.storage.TempShuffleBlockId;
@@ -47,6 +46,7 @@ import org.apache.spark.unsafe.UnsafeAlignedOffset;
 import org.apache.spark.unsafe.array.LongArray;
 import org.apache.spark.unsafe.memory.MemoryBlock;
 import org.apache.spark.util.Utils;
+import org.apache.spark.storage.ShuffleFileSystem;
 
 /**
  * An external sorter that is specialized for sort-based shuffle.
@@ -73,9 +73,9 @@ final class ShuffleExternalSorter extends MemoryConsumer {
 
   private final int numPartitions;
   private final TaskMemoryManager taskMemoryManager;
-  private final BlockManager blockManager;
   private final TaskContext taskContext;
   private final ShuffleWriteMetrics writeMetrics;
+  private final ShuffleFileSystem shuffleFileSystem;
 
   /**
    * Force this sorter to spill when there are this many elements in memory.
@@ -108,30 +108,30 @@ final class ShuffleExternalSorter extends MemoryConsumer {
 
   ShuffleExternalSorter(
       TaskMemoryManager memoryManager,
-      BlockManager blockManager,
       TaskContext taskContext,
       int initialSize,
       int numPartitions,
       SparkConf conf,
-      ShuffleWriteMetrics writeMetrics) {
+      ShuffleWriteMetrics writeMetrics,
+      ShuffleFileSystem shuffleFileSystem) {
     super(memoryManager,
       (int) Math.min(PackedRecordPointer.MAXIMUM_PAGE_SIZE_BYTES, memoryManager.pageSizeBytes()),
       memoryManager.getTungstenMemoryMode());
     this.taskMemoryManager = memoryManager;
-    this.blockManager = blockManager;
     this.taskContext = taskContext;
     this.numPartitions = numPartitions;
     // Use getSizeAsKb (not bytes) to maintain backwards compatibility if no units are provided
     this.fileBufferSizeBytes =
-        (int) (long) conf.get(package$.MODULE$.SHUFFLE_FILE_BUFFER_SIZE()) * 1024;
+      (int) (long) conf.get(package$.MODULE$.SHUFFLE_FILE_BUFFER_SIZE()) * 1024;
     this.numElementsForSpillThreshold =
-        (int) conf.get(package$.MODULE$.SHUFFLE_SPILL_NUM_ELEMENTS_FORCE_SPILL_THRESHOLD());
+      (int) conf.get(package$.MODULE$.SHUFFLE_SPILL_NUM_ELEMENTS_FORCE_SPILL_THRESHOLD());
     this.writeMetrics = writeMetrics;
     this.inMemSorter = new ShuffleInMemorySorter(
       this, initialSize, conf.getBoolean("spark.shuffle.sort.useRadixSort", true));
     this.peakMemoryUsedBytes = getMemoryUsage();
     this.diskWriteBufferSize =
-        (int) (long) conf.get(package$.MODULE$.SHUFFLE_DISK_WRITE_BUFFER_SIZE());
+      (int) (long) conf.get(package$.MODULE$.SHUFFLE_DISK_WRITE_BUFFER_SIZE());
+    this.shuffleFileSystem = shuffleFileSystem;
   }
 
   /**
@@ -169,9 +169,8 @@ final class ShuffleExternalSorter extends MemoryConsumer {
     // Because this output will be read during shuffle, its compression codec must be controlled by
     // spark.shuffle.compress instead of spark.shuffle.spill.compress, so we need to use
     // createTempShuffleBlock here; see SPARK-3426 for more details.
-    final Tuple2<TempShuffleBlockId, File> spilledFileInfo =
-      blockManager.diskBlockManager().createTempShuffleBlock();
-    final File file = spilledFileInfo._2();
+    final Tuple2<TempShuffleBlockId, URI> spilledFileInfo = shuffleFileSystem.createTempShuffleBlock();
+    final URI file = spilledFileInfo._2();
     final TempShuffleBlockId blockId = spilledFileInfo._1();
     final SpillInfo spillInfo = new SpillInfo(numPartitions, file, blockId);
 
@@ -181,68 +180,70 @@ final class ShuffleExternalSorter extends MemoryConsumer {
     // around this, we pass a dummy no-op serializer.
     final SerializerInstance ser = DummySerializerInstance.INSTANCE;
 
-    final DiskBlockObjectWriter writer =
-      blockManager.getDiskWriter(blockId, file, ser, fileBufferSizeBytes, writeMetricsToUse);
-
     int currentPartition = -1;
-    final int uaoSize = UnsafeAlignedOffset.getUaoSize();
-    while (sortedRecords.hasNext()) {
-      sortedRecords.loadNext();
-      final int partition = sortedRecords.packedRecordPointer.getPartitionId();
-      assert (partition >= currentPartition);
-      if (partition != currentPartition) {
-        // Switch to the new partition
-        if (currentPartition != -1) {
-          final FileSegment fileSegment = writer.commitAndGet();
-          spillInfo.partitionLengths[currentPartition] = fileSegment.length();
+
+    try (DiskBlockObjectWriter writer = shuffleFileSystem.getDiskWriter(
+      blockId, file, ser, fileBufferSizeBytes, writeMetricsToUse)) {
+
+      final int uaoSize = UnsafeAlignedOffset.getUaoSize();
+      while (sortedRecords.hasNext()) {
+        sortedRecords.loadNext();
+        final int partition = sortedRecords.packedRecordPointer.getPartitionId();
+        assert (partition >= currentPartition);
+        if (partition != currentPartition) {
+          // Switch to the new partition
+          if (currentPartition != -1) {
+            final FileSegment fileSegment = writer.commitAndGet();
+            spillInfo.partitionLengths[currentPartition] = fileSegment.length();
+          }
+          currentPartition = partition;
         }
-        currentPartition = partition;
+
+        final long recordPointer = sortedRecords.packedRecordPointer.getRecordPointer();
+        final Object recordPage = taskMemoryManager.getPage(recordPointer);
+        final long recordOffsetInPage = taskMemoryManager.getOffsetInPage(recordPointer);
+        int dataRemaining = UnsafeAlignedOffset.getSize(recordPage, recordOffsetInPage);
+        long recordReadPosition = recordOffsetInPage + uaoSize; // skip over record length
+        while (dataRemaining > 0) {
+          final int toTransfer = Math.min(diskWriteBufferSize, dataRemaining);
+          Platform.copyMemory(
+            recordPage, recordReadPosition, writeBuffer, Platform.BYTE_ARRAY_OFFSET, toTransfer);
+          writer.write(writeBuffer, 0, toTransfer);
+          recordReadPosition += toTransfer;
+          dataRemaining -= toTransfer;
+        }
+        writer.recordWritten();
       }
 
-      final long recordPointer = sortedRecords.packedRecordPointer.getRecordPointer();
-      final Object recordPage = taskMemoryManager.getPage(recordPointer);
-      final long recordOffsetInPage = taskMemoryManager.getOffsetInPage(recordPointer);
-      int dataRemaining = UnsafeAlignedOffset.getSize(recordPage, recordOffsetInPage);
-      long recordReadPosition = recordOffsetInPage + uaoSize; // skip over record length
-      while (dataRemaining > 0) {
-        final int toTransfer = Math.min(diskWriteBufferSize, dataRemaining);
-        Platform.copyMemory(
-          recordPage, recordReadPosition, writeBuffer, Platform.BYTE_ARRAY_OFFSET, toTransfer);
-        writer.write(writeBuffer, 0, toTransfer);
-        recordReadPosition += toTransfer;
-        dataRemaining -= toTransfer;
+      final FileSegment committedSegment = writer.commitAndGet();
+      writer.close();
+      // If `writeSortedFile()` was called from `closeAndGetSpills()` and no records were inserted,
+      // then the file might be empty. Note that it might be better to avoid calling
+      // writeSortedFile() in that case.
+      if (currentPartition != -1) {
+        spillInfo.partitionLengths[currentPartition] = committedSegment.length();
+        spills.add(spillInfo);
       }
-      writer.recordWritten();
-    }
 
-    final FileSegment committedSegment = writer.commitAndGet();
-    writer.close();
-    // If `writeSortedFile()` was called from `closeAndGetSpills()` and no records were inserted,
-    // then the file might be empty. Note that it might be better to avoid calling
-    // writeSortedFile() in that case.
-    if (currentPartition != -1) {
-      spillInfo.partitionLengths[currentPartition] = committedSegment.length();
-      spills.add(spillInfo);
-    }
-
-    if (!isLastFile) {  // i.e. this is a spill file
-      // The current semantics of `shuffleRecordsWritten` seem to be that it's updated when records
-      // are written to disk, not when they enter the shuffle sorting code. DiskBlockObjectWriter
-      // relies on its `recordWritten()` method being called in order to trigger periodic updates to
-      // `shuffleBytesWritten`. If we were to remove the `recordWritten()` call and increment that
-      // counter at a higher-level, then the in-progress metrics for records written and bytes
-      // written would get out of sync.
-      //
-      // When writing the last file, we pass `writeMetrics` directly to the DiskBlockObjectWriter;
-      // in all other cases, we pass in a dummy write metrics to capture metrics, then copy those
-      // metrics to the true write metrics here. The reason for performing this copying is so that
-      // we can avoid reporting spilled bytes as shuffle write bytes.
-      //
-      // Note that we intentionally ignore the value of `writeMetricsToUse.shuffleWriteTime()`.
-      // Consistent with ExternalSorter, we do not count this IO towards shuffle write time.
-      // This means that this IO time is not accounted for anywhere; SPARK-3577 will fix this.
-      writeMetrics.incRecordsWritten(writeMetricsToUse.recordsWritten());
-      taskContext.taskMetrics().incDiskBytesSpilled(writeMetricsToUse.bytesWritten());
+      if (!isLastFile) {  // i.e. this is a spill file
+        // The current semantics of `shuffleRecordsWritten` seem to be that it's updated when records
+        // are written to disk, not when they enter the shuffle sorting code. DiskBlockObjectWriter
+        // relies on its `recordWritten()` method being called in order to trigger periodic updates to
+        // `shuffleBytesWritten`. If we were to remove the `recordWritten()` call and increment that
+        // counter at a higher-level, then the in-progress metrics for records written and bytes
+        // written would get out of sync.
+        //
+        // When writing the last file, we pass `writeMetrics` directly to the DiskBlockObjectWriter;
+        // in all other cases, we pass in a dummy write metrics to capture metrics, then copy those
+        // metrics to the true write metrics here. The reason for performing this copying is so that
+        // we can avoid reporting spilled bytes as shuffle write bytes.
+        //
+        // Note that we intentionally ignore the value of `writeMetricsToUse.shuffleWriteTime()`.
+        // Consistent with ExternalSorter, we do not count this IO towards shuffle write time.
+        // This means that this IO time is not accounted for anywhere; SPARK-3577 will fix this.
+        writeMetrics.incRecordsWritten(writeMetricsToUse.recordsWritten());
+        taskContext.taskMetrics().incDiskBytesSpilled(writeMetricsToUse.bytesWritten());
+      }
     }
   }
 
@@ -317,7 +318,7 @@ final class ShuffleExternalSorter extends MemoryConsumer {
       inMemSorter = null;
     }
     for (SpillInfo spill : spills) {
-      if (spill.file.exists() && !spill.file.delete()) {
+      if (shuffleFileSystem.exists(spill.file) && !shuffleFileSystem.delete(spill.file)) {
         logger.error("Unable to delete spill file {}", spill.file.getPath());
       }
     }
@@ -329,7 +330,7 @@ final class ShuffleExternalSorter extends MemoryConsumer {
    * obtained, then the in-memory data will be spilled to disk.
    */
   private void growPointerArrayIfNecessary() throws IOException {
-    assert(inMemSorter != null);
+    assert (inMemSorter != null);
     if (!inMemSorter.hasSpaceForAnotherRecord()) {
       long used = inMemSorter.getMemoryUsage();
       LongArray array;
@@ -423,5 +424,4 @@ final class ShuffleExternalSorter extends MemoryConsumer {
     }
     return spills.toArray(new SpillInfo[spills.size()]);
   }
-
 }

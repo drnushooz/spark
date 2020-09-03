@@ -21,15 +21,18 @@ import com.google.common.io.ByteStreams;
 import com.google.common.io.Closeables;
 import org.apache.spark.SparkEnv;
 import org.apache.spark.TaskContext;
-import org.apache.spark.io.NioBufferedFileInputStream;
+import org.apache.spark.internal.config.package$;
+import org.apache.spark.internal.config.ConfigEntry;
 import org.apache.spark.io.ReadAheadInputStream;
 import org.apache.spark.serializer.SerializerManager;
 import org.apache.spark.storage.BlockId;
+import org.apache.spark.storage.ShuffleFileSystem;
 import org.apache.spark.unsafe.Platform;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
 import java.io.*;
+import java.net.URI;
 
 /**
  * Reads spill files written by {@link UnsafeSorterSpillWriter} (see that class for a description
@@ -55,9 +58,10 @@ public final class UnsafeSorterSpillReader extends UnsafeSorterIterator implemen
 
   public UnsafeSorterSpillReader(
       SerializerManager serializerManager,
-      File file,
-      BlockId blockId) throws IOException {
-    assert (file.length() > 0);
+      URI file,
+      BlockId blockId,
+      ShuffleFileSystem shuffleFileSystem) throws IOException {
+    assert (shuffleFileSystem.getFileSize(file) > 0);
     long bufferSizeBytes =
         SparkEnv.get() == null ?
             DEFAULT_BUFFER_SIZE_BYTES:
@@ -74,8 +78,7 @@ public final class UnsafeSorterSpillReader extends UnsafeSorterIterator implemen
     final boolean readAheadEnabled = SparkEnv.get() != null &&
         SparkEnv.get().conf().getBoolean("spark.unsafe.sorter.spill.read.ahead.enabled", true);
 
-    final InputStream bs =
-        new NioBufferedFileInputStream(file, (int) bufferSizeBytes);
+    final InputStream bs = shuffleFileSystem.open(file, (int) bufferSizeBytes);
     try {
       if (readAheadEnabled) {
         this.in = new ReadAheadInputStream(serializerManager.wrapStream(blockId, bs),

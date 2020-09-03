@@ -25,6 +25,7 @@ import org.apache.spark.memory.MemoryTestingUtils
 import org.apache.spark.sql.catalyst.expressions.UnsafeRow
 import org.apache.spark.util.Benchmark
 import org.apache.spark.util.collection.unsafe.sort.UnsafeExternalSorter
+import org.apache.spark.storage.ShuffleFileSystem
 
 object ExternalAppendOnlyUnsafeRowArrayBenchmark {
 
@@ -115,7 +116,6 @@ object ExternalAppendOnlyUnsafeRowArrayBenchmark {
       for (_ <- 0L until iterations) {
         val array = UnsafeExternalSorter.create(
           TaskContext.get().taskMemoryManager(),
-          SparkEnv.get.blockManager,
           SparkEnv.get.serializerManager,
           TaskContext.get(),
           null,
@@ -123,7 +123,8 @@ object ExternalAppendOnlyUnsafeRowArrayBenchmark {
           1024,
           SparkEnv.get.memoryManager.pageSizeBytes,
           numSpillThreshold,
-          false)
+          false,
+          ShuffleFileSystem())
 
         rows.foreach(x =>
           array.insertRecord(
